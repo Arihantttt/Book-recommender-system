@@ -1,0 +1,9 @@
+expr = F.sum(
+            F.when(
+                F.col(col).isNotNull() & (
+                    F.col(col) > F.coalesce(F.col(f"{col}_prev"), F.lit(0))
+                ),
+                # Calculate the exact difference instead of just returning 1
+                F.col(col) - F.coalesce(F.col(f"{col}_prev"), F.lit(0))
+            ).otherwise(0)
+        ).alias(f"new_{col}")
