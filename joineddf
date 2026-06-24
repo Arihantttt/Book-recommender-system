@@ -1,0 +1,64 @@
+from pyspark.sql import functions as F
+
+# 1. Define Join Keys
+join_keys = [
+    "Source_Ind", "digital_login", "combined_login", "cb_app_login",
+    "Account_Adoption", "my_account_login", "Registered_Account",
+    "TENURE_BUCKET", "Convergence_Eligible"
+]
+
+# 2. Perform the full outer join
+joined_df = result.alias("curr").join(
+    result_prev.alias("prev"),
+    on=join_keys,
+    how="full_outer"
+)
+
+# 3. Coalesce join keys
+select_exprs = [
+    F.coalesce(F.col(f"curr.{k}"), F.col(f"prev.{k}")).alias(k) for k in join_keys
+]
+
+# 4. Define your current fiscal month
+# (Update this variable dynamically in your pipeline as needed)
+current_fiscal_month = "2026-01-21"
+
+# 5. Add current columns, EXCEPT join_keys and Fiscal_Month
+curr_columns = [
+    F.col(f"curr.{c}").alias(c) 
+    for c in result.columns 
+    if c not in join_keys and c != "Fiscal_Month"
+]
+select_exprs.extend(curr_columns)
+
+# 6. Hardcode the Fiscal_Month to ensure NO null partitions
+select_exprs.append(F.lit(current_fiscal_month).alias("Fiscal_Month"))
+
+# 7. Alias the previous ending metrics to current starting metrics
+prev_metrics = [
+    F.col("prev.ADV_SECURITY_ENDING_SUBS").alias("ADV_SECURITY_STARTING_SUBS"),
+    F.col("prev.ROUTER_ENDING_SUBS").alias("ROUTER_STARTING_SUBS"),
+    F.col("prev.SD_WAN_ENDING_SUBS").alias("SD_WAN_STARTING_SUBS"),
+    F.col("prev.DDOS_ENDING_SUBS").alias("DDOS_STARTING_SUBS"),
+    F.col("prev.SIP_ENDING_SUBS").alias("SIP_STARTING_SUBS"),
+    F.col("prev.BVE_ENDING_SUBS").alias("BVE_STARTING_SUBS"),
+    F.col("prev.PRI_ENDING_SUBS").alias("PRI_STARTING_SUBS"),
+    F.col("prev.EDI_ENDING_SUBS").alias("EDI_STARTING_SUBS"),
+    F.col("prev.EVPL_ENDING_SUBS").alias("EVPL_STARTING_SUBS"),
+    F.col("prev.ENS_ENDING_SUBS").alias("ENS_STARTING_SUBS"),
+    F.col("prev.EPL_ENDING_SUBS").alias("EPL_STARTING_SUBS"),
+    F.col("prev.WIRELESS_BACKUP_ENDING_SUBS").alias("WIRELESS_BACKUP_STARTING_SUBS"),
+    F.col("prev.WAVELENGTH_ENDING_SUBS").alias("WAVELENGTH_STARTING_SUBS"),
+    F.col("prev.ADVANCED_VOICE_ENDING_SUBS").alias("ADVANCED_VOICE_STARTING_SUBS"),
+    F.col("prev.ACTIVECORE_ENDING_SUBS").alias("ACTIVECORE_STARTING_SUBS"),
+    F.col("prev.ETHERNET_ENDING_SUBS").alias("ETHERNET_STARTING_SUBS")
+]
+select_exprs.extend(prev_metrics)
+
+# 8. Apply the combined select expressions
+final_df = joined_df.select(*select_exprs)
+
+# 9. Write out the final dataframe
+final_df.write.partitionBy("Fiscal_Month") \
+        .mode("overwrite") \
+        .parquet(final_table_path)
