@@ -1,0 +1,194 @@
+Here is the updated implementation. I have renamed the scoring functions inside the Pandas iterator back to their original names from your first script (jw_udf, token_set_udf, and dl_udf).
+Please note that because this is now running inside a Pandas iterator using native Python strings, you must ensure that these three functions imported from your library are the base Python functions (which return a float), and not wrapped as PySpark F.udf() objects.
+Part 1: Updated Import Note
+We update the placeholder imports to reflect the original function names.
+# Note: Ensure you import your underlying Python string matching functions
+# from your_custom_library import jw_udf, token_set_udf, dl_udf
+
+Part 2: Updated Heavy Scoring Section
+Inside the fuzzy_match_batch iterator, the heavy scoring block is reverted to use the exact function names from your original code.
+                    # Heavy Scoring
+                    jw = jw_udf(t['norm_name'], u_norm) 
+                    token = token_set_udf(t['norm_name'], u_norm)
+                    trigram_sim = calc_trigram_jaccard(t['trigrams'], u_trigrams)
+                    
+                    dl = 0.0
+                    if jw >= 0.75 or is_substring == 1:
+                        dl = dl_udf(t['norm_name'], u_norm)
+
+Complete Code Block
+Here is the final, ready-to-run script with the original function names restored.
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.window import Window
+import pandas as pd
+from typing import Iterator
+
+# Note: Ensure you import your underlying Python string matching functions
+# from your_custom_library import jw_udf, token_set_udf, dl_udf
+
+def get_trigrams(text):
+    if not text: return []
+    padded = f" {text} "
+    return [padded[i:i+3] for i in range(len(padded)-2)]
+
+def calc_trigram_jaccard(set_a, set_b):
+    if not set_a or not set_b: return 0.0
+    union = len(set_a.union(set_b))
+    return len(set_a.intersection(set_b)) / union if union > 0 else 0.0
+
+def high_accuracy_fuzzy_match(
+    spark, 
+    targets_df, 
+    universe_df, 
+    target_name_col, 
+    universe_name_col, 
+    account_id_col,
+    min_confidence: float = 0.85, 
+    top_n: int = None
+):
+    
+    # 1. Normalize Targets
+    targets_clean = (
+        targets_df
+        .select(F.col(target_name_col).alias("target_name"))
+        .where(F.col("target_name").isNotNull())
+        .withColumn("norm_name", normalize_name_col(F.col("target_name"))) # Assuming this is defined
+        .where(F.length("norm_name") > 0)
+    )
+
+    # 2. Pre-compute Target Metadata 
+    targets_list = []
+    for row in targets_clean.collect():
+        name = row['norm_name']
+        tokens = name.split()
+        targets_list.append({
+            "target_name": row['target_name'],
+            "norm_name": name,
+            "tokens": set(tokens),
+            "compact": name.replace(" ", ""),
+            "acronym": "".join([w[0] for w in tokens if w]),
+            "trigrams": set(get_trigrams(name))
+        })
+        
+    broadcast_targets = spark.sparkContext.broadcast(targets_list)
+
+    # 3. Normalize Universe
+    universe_clean = (
+        universe_df
+        .select(
+            F.col('athena_hq_est_total_spend'),
+            F.col(universe_name_col).alias("matched_name"),
+            F.col(account_id_col).alias("account_id")
+        )
+        .where(F.col("matched_name").isNotNull())
+        .withColumn("norm_name", normalize_name_col(F.col("matched_name")))
+        .where(F.length("norm_name") > 0)
+    )
+
+    # 4. MapInPandas Engine
+    def fuzzy_match_batch(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+        targets = broadcast_targets.value 
+        
+        for pdf in iterator:
+            valid_matches = []
+            
+            for _, u_row in pdf.iterrows():
+                u_norm = u_row['norm_name']
+                u_tokens = set(u_norm.split())
+                u_compact = u_norm.replace(" ", "")
+                u_acronym = "".join([w[0] for w in u_tokens if w])
+                u_trigrams = set(get_trigrams(u_norm))
+                
+                for t in targets:
+                    # High Recall Pre-Filters
+                    is_acronym = 1 if (t['acronym'] == u_compact or t['compact'] == u_acronym) else 0
+                    is_substring = 1 if (t['norm_name'] in u_norm or u_norm in t['norm_name']) else 0
+                    has_trigram_overlap = len(t['trigrams'].intersection(u_trigrams)) >= 2
+                    has_word_overlap = len(t['tokens'].intersection(u_tokens)) > 0
+                    
+                    if not (is_acronym or is_substring or has_word_overlap or has_trigram_overlap):
+                        continue 
+                    
+                    # Heavy Scoring
+                    jw = jw_udf(t['norm_name'], u_norm) 
+                    token = token_set_udf(t['norm_name'], u_norm)
+                    trigram_sim = calc_trigram_jaccard(t['trigrams'], u_trigrams)
+                    
+                    dl = 0.0
+                    if jw >= 0.75 or is_substring == 1:
+                        dl = dl_udf(t['norm_name'], u_norm)
+                        
+                    blend_score = (0.50 * jw) + (0.20 * token) + (0.15 * trigram_sim) + (0.10 * is_substring) + (0.05 * dl)
+                    
+                    # Original Confidence Overrides
+                    if t['norm_name'] == u_norm: confidence = 1.0
+                    elif is_substring == 1:      confidence = max(blend_score, 0.88)
+                    elif is_acronym == 1:        confidence = max(blend_score, 0.87)
+                    elif token >= 0.999 and jw >= 0.80: confidence = max(blend_score, 0.90)
+                    else:                        confidence = blend_score
+                        
+                    confidence = round(confidence, 4)
+                    
+                    # Original Match Types
+                    if t['norm_name'] == u_norm: match_type = "exact"
+                    elif is_substring == 1:      match_type = "substring"
+                    elif is_acronym == 1:        match_type = "acronym"
+                    elif token >= 0.999:         match_type = "token_subset"
+                    else:                        match_type = "fuzzy"
+                    
+                    if confidence >= (min_confidence - 0.05):
+                        valid_matches.append({
+                            "athena_hq_est_total_spend": u_row['athena_hq_est_total_spend'],
+                            "target_name": t['target_name'],
+                            "matched_name": u_row['matched_name'],
+                            "account_id": u_row['account_id'],
+                            "confidence": confidence,
+                            "match_type": match_type,
+                            "jw_score": jw,
+                            "token_score": token,
+                            "substring_score": float(is_substring),
+                            "dl_score": dl,
+                            "target_norm": t['norm_name']
+                        })
+            
+            if valid_matches:
+                yield pd.DataFrame(valid_matches)
+
+    # 5. Output Schema
+    output_schema = StructType([
+        StructField("athena_hq_est_total_spend", DoubleType(), True),
+        StructField("target_name", StringType(), True),
+        StructField("matched_name", StringType(), True),
+        StructField("account_id", StringType(), True),
+        StructField("confidence", DoubleType(), True),
+        StructField("match_type", StringType(), True),
+        StructField("jw_score", DoubleType(), True),
+        StructField("token_score", DoubleType(), True),
+        StructField("substring_score", DoubleType(), True),
+        StructField("dl_score", DoubleType(), True),
+        StructField("target_norm", StringType(), True)
+    ])
+
+    # 6. Execute Zero-Shuffle Operation
+    scored_candidates = universe_clean.mapInPandas(fuzzy_match_batch, schema=output_schema)
+
+    # 7. Apply Top N Filter
+    if top_n:
+        w = Window.partitionBy("target_norm").orderBy(F.desc("confidence"))
+        scored_candidates = (
+            scored_candidates
+            .withColumn("rank", F.row_number().over(w))
+            .where(F.col("rank") <= top_n)
+            .drop("rank")
+        )
+
+    # 8. Final Select and Deduplication
+    result = (
+        scored_candidates
+        .drop("target_norm")
+        .dropDuplicates(["target_name", "account_id"])
+    )
+
+    return result
+
