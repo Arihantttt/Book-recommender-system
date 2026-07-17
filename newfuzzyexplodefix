@@ -1,0 +1,148 @@
+import pyspark.sql.functions as F
+from pyspark.sql.types import ArrayType, StringType
+from pyspark.sql.window import Window
+
+def get_trigrams(text):
+    if not text:
+        return []
+    padded = f" {text} "
+    return [padded[i:i+3] for i in range(len(padded)-2)]
+
+trigram_udf = F.udf(get_trigrams, ArrayType(StringType()))
+
+def optimize_fuzzy_match(
+    targets_df, 
+    universe_df, 
+    target_name_col, 
+    universe_name_col, 
+    account_id_col,
+    min_confidence: float = 0.85, 
+    top_n: int = None
+):
+    
+    # 1. Normalize and Prep Targets
+    targets_clean = (
+        targets_df
+        .select(F.col(target_name_col).alias("target_name"))
+        .where(F.col("target_name").isNotNull())
+        .withColumn("norm_name", normalize_name_col(F.col("target_name"))) 
+        .where(F.length("norm_name") > 0)
+        .withColumn("target_id", F.monotonically_increasing_id())
+    )
+
+    # 2. Normalize and Prep Universe
+    universe_clean = (
+        universe_df
+        .select(
+            F.col(universe_name_col).alias("matched_name"),
+            F.col(account_id_col).alias("account_id")
+        )
+        .where(F.col("matched_name").isNotNull())
+        .withColumn("norm_name", normalize_name_col(F.col("matched_name")))
+        .where(F.length("norm_name") > 0)
+    )
+
+    # 3. Extract Distinct Trigrams from Targets
+    targets_trigrams = (
+        targets_clean
+        .withColumn("trigram", F.explode(trigram_udf(F.col("norm_name"))))
+    )
+    
+    distinct_target_trigrams = targets_trigrams.select("trigram").distinct()
+    target_trigram_list = [row.trigram for row in distinct_target_trigrams.collect()]
+    
+    # Convert list to Spark Array literal for fast overlap checking
+    target_trigrams_col = F.array([F.lit(t) for t in target_trigram_list])
+
+    # 4. Filter the 35M Universe IN-MEMORY (Prevents Ephemeral Storage Crash)
+    universe_candidates = (
+        universe_clean
+        .withColumn("uni_trigrams", trigram_udf(F.col("norm_name")))
+        # Check for overlap BEFORE exploding to drop 99% of data instantly
+        .filter(F.arrays_overlap(F.col("uni_trigrams"), target_trigrams_col))
+        # Explode only the tiny surviving subset
+        .withColumn("trigram", F.explode(F.col("uni_trigrams")))
+        .filter(F.col("trigram").isin(target_trigram_list))
+    )
+
+    # 5. Join Candidates and Calculate Trigram Overlap
+    candidate_pairs = (
+        targets_trigrams.alias("t")
+        .join(universe_candidates.alias("u"), on="trigram", how="inner")
+        .groupBy(
+            F.col("t.target_id"),
+            F.col("t.target_name"),
+            F.col("t.norm_name").alias("target_norm"),
+            F.col("u.account_id"),
+            F.col("u.matched_name"),
+            F.col("u.norm_name").alias("matched_norm")
+        )
+        .agg(F.count("trigram").alias("shared_trigram_count"))
+        .withColumn("len_t", F.length("target_norm") - 2) 
+        .withColumn("len_u", F.length("matched_norm") - 2)
+        .withColumn(
+            "trigram_jaccard", 
+            F.col("shared_trigram_count") / (F.col("len_t") + F.col("len_u") - F.col("shared_trigram_count"))
+        )
+        .filter(F.col("trigram_jaccard") > 0.2) 
+    )
+
+    # 6. Apply Heavy UDF Scoring 
+    substring_expr = F.when(
+        F.col("target_norm").contains(F.col("matched_norm")) |
+        F.col("matched_norm").contains(F.col("target_norm")),
+        F.lit(1.0)
+    ).otherwise(F.lit(0.0))
+
+    scored_candidates = (
+        candidate_pairs
+        .withColumn("jw_score", jw_udf("target_norm", "matched_norm"))
+        .withColumn("token_score", token_set_udf("target_norm", "matched_norm"))
+        .withColumn("substring_score", substring_expr)
+        .withColumn(
+            "dl_score",
+            F.when(
+                (F.col("jw_score") >= 0.75) | (substring_expr == 1),
+                dl_udf("target_norm", "matched_norm")
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn(
+            "blend_score",
+            0.50 * F.col("jw_score") +
+            0.20 * F.col("token_score") +
+            0.15 * F.col("trigram_jaccard") +
+            0.10 * F.col("substring_score") +
+            0.05 * F.col("dl_score")
+        )
+        .withColumn("confidence", F.round(F.col("blend_score"), 4))
+        .filter(F.col("confidence") >= (min_confidence - 0.05))
+    )
+
+    # 7. Apply Top N Filter
+    if top_n:
+        w = Window.partitionBy("target_norm").orderBy(F.desc("confidence"))
+        scored_candidates = (
+            scored_candidates
+            .withColumn("rank", F.row_number().over(w))
+            .where(F.col("rank") <= top_n)
+            .drop("rank")
+        )
+
+    # 8. Final Select and Deduplication
+    result = (
+        scored_candidates
+        .select(
+            "target_name",
+            "matched_name",
+            "account_id",
+            "confidence",
+            "jw_score",
+            "token_score",
+            "trigram_jaccard",
+            "substring_score",
+            "dl_score"
+        )
+        .dropDuplicates(["target_name", "account_id"])
+    )
+
+    return result
