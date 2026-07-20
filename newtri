@@ -1,21 +1,11 @@
 import pyspark.sql.functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.types import DoubleType
 from pyspark.sql.window import Window
+import re
 
-# Note: Ensure you import your underlying Python string matching functions
-# from your_custom_library import jw_udf, token_set_udf, dl_udf
+STOP_WORDS = ["inc", "llc", "corp", "corporation", "ltd", "limited", "the", "and", "co", "company"]
 
-def get_trigrams(text):
-    if not text: return []
-    padded = f" {text} "
-    return [padded[i:i+3] for i in range(len(padded)-2)]
-
-def calc_trigram_jaccard(set_a, set_b):
-    if not set_a or not set_b: return 0.0
-    union = len(set_a.union(set_b))
-    return len(set_a.intersection(set_b)) / union if union > 0 else 0.0
-
-def high_accuracy_fuzzy_match_rdd(
+def optimize_fuzzy_match_pyspark(
     spark, 
     targets_df, 
     universe_df, 
@@ -25,33 +15,17 @@ def high_accuracy_fuzzy_match_rdd(
     min_confidence: float = 0.85, 
     top_n: int = None
 ):
-    
     # 1. Normalize Targets
     targets_clean = (
         targets_df
         .select(F.col(target_name_col).alias("target_name"))
         .where(F.col("target_name").isNotNull())
-        .withColumn("norm_name", normalize_name_col(F.col("target_name"))) # Ensure normalize_name_col is defined
-        .where(F.length("norm_name") > 0)
+        .withColumn("target_norm", normalize_name_col(F.col("target_name")))
+        .where(F.length("target_norm") > 0)
+        .withColumn("target_id", F.monotonically_increasing_id())
     )
 
-    # 2. Pre-compute Target Metadata 
-    targets_list = []
-    for row in targets_clean.collect():
-        name = row['norm_name']
-        tokens = name.split()
-        targets_list.append({
-            "target_name": row['target_name'],
-            "norm_name": name,
-            "tokens": set(tokens),
-            "compact": name.replace(" ", ""),
-            "acronym": "".join([w[0] for w in tokens if w]),
-            "trigrams": set(get_trigrams(name))
-        })
-        
-    broadcast_targets = spark.sparkContext.broadcast(targets_list)
-
-    # 3. Normalize Universe
+    # 2. Normalize Universe
     universe_clean = (
         universe_df
         .select(
@@ -60,110 +34,177 @@ def high_accuracy_fuzzy_match_rdd(
             F.col(account_id_col).alias("account_id")
         )
         .where(F.col("matched_name").isNotNull())
-        .withColumn("norm_name", normalize_name_col(F.col("matched_name")))
-        .where(F.length("norm_name") > 0)
+        .withColumn("matched_norm", normalize_name_col(F.col("matched_name")))
+        .where(F.length("matched_norm") > 0)
     )
 
-    # 4. Standard Python Iterator for RDD mapPartitions
-    def fuzzy_match_partition(iterator):
-        targets = broadcast_targets.value 
+    # 3. Strategy A: Regex Substring Blocking
+    target_names = [row.target_norm for row in targets_clean.collect()]
+    regex_pattern = "|".join([re.escape(name) for name in target_names])
+    
+    substring_universe = universe_clean.filter(F.col("matched_norm").rlike(regex_pattern))
+    
+    substring_pairs = (
+        targets_clean.alias("t")
+        .crossJoin(F.broadcast(substring_universe.alias("u")))
+        .filter(
+            F.col("u.matched_norm").contains(F.col("t.target_norm")) |
+            F.col("t.target_norm").contains(F.col("u.matched_norm"))
+        )
+        .select(
+            F.col("t.target_id"), 
+            F.col("u.account_id"),
+            F.lit(0).alias("is_acronym")
+        )
+    )
+
+    # 4. Strategy B: Native Acronym Blocking
+    def add_acronym_cols(df, norm_col):
+        df = df.withColumn("compact", F.regexp_replace(norm_col, " ", ""))
+        df = df.withColumn("words", F.split(norm_col, " "))
+        df = df.withColumn("acronym", F.array_join(F.expr("transform(words, x -> substring(x, 1, 1))"), ""))
+        return df
         
-        for u_row in iterator:
-            u_norm = u_row.norm_name
-            u_spend = u_row.athena_hq_est_total_spend
-            u_matched_name = u_row.matched_name
-            u_account_id = u_row.account_id
-            
-            u_tokens = set(u_norm.split())
-            u_compact = u_norm.replace(" ", "")
-            u_acronym = "".join([w[0] for w in u_tokens if w])
-            u_trigrams = set(get_trigrams(u_norm))
-            
-            for t in targets:
-                # High Recall Pre-Filters
-                is_acronym = 1 if (t['acronym'] == u_compact or t['compact'] == u_acronym) else 0
-                is_substring = 1 if (t['norm_name'] in u_norm or u_norm in t['norm_name']) else 0
-                has_trigram_overlap = len(t['trigrams'].intersection(u_trigrams)) >= 2
-                has_word_overlap = len(t['tokens'].intersection(u_tokens)) > 0
-                
-                if not (is_acronym or is_substring or has_word_overlap or has_trigram_overlap):
-                    continue 
-                
-                # Heavy Scoring
-                jw = jw_udf(t['norm_name'], u_norm) 
-                token = token_set_udf(t['norm_name'], u_norm)
-                trigram_sim = calc_trigram_jaccard(t['trigrams'], u_trigrams)
-                
-                dl = 0.0
-                if jw >= 0.75 or is_substring == 1:
-                    dl = dl_udf(t['norm_name'], u_norm)
-                    
-                blend_score = (0.50 * jw) + (0.20 * token) + (0.15 * trigram_sim) + (0.10 * is_substring) + (0.05 * dl)
-                
-                # Confidence Overrides
-                if t['norm_name'] == u_norm: confidence = 1.0
-                elif is_substring == 1:      confidence = max(blend_score, 0.88)
-                elif is_acronym == 1:        confidence = max(blend_score, 0.87)
-                elif token >= 0.999 and jw >= 0.80: confidence = max(blend_score, 0.90)
-                else:                        confidence = blend_score
-                    
-                confidence = round(confidence, 4)
-                
-                # Match Types
-                if t['norm_name'] == u_norm: match_type = "exact"
-                elif is_substring == 1:      match_type = "substring"
-                elif is_acronym == 1:        match_type = "acronym"
-                elif token >= 0.999:         match_type = "token_subset"
-                else:                        match_type = "fuzzy"
-                
-                if confidence >= (min_confidence - 0.05):
-                    yield (
-                        u_spend,
-                        t['target_name'],
-                        u_matched_name,
-                        u_account_id,
-                        confidence,
-                        match_type,
-                        jw,
-                        token,
-                        float(is_substring),
-                        dl,
-                        t['norm_name']
-                    )
+    t_acr = add_acronym_cols(targets_clean, "target_norm")
+    u_acr = add_acronym_cols(universe_clean, "matched_norm")
+    
+    acronym_pairs = (
+        t_acr.alias("t").join(u_acr.alias("u"), 
+            (F.col("t.compact") == F.col("u.acronym")) |
+            (F.col("t.acronym") == F.col("u.compact"))
+        )
+        .select(
+            F.col("t.target_id"), 
+            F.col("u.account_id"),
+            F.lit(1).alias("is_acronym")
+        )
+    )
 
-    # 5. Output Schema
-    output_schema = StructType([
-        StructField("athena_hq_est_total_spend", DoubleType(), True),
-        StructField("target_name", StringType(), True),
-        StructField("matched_name", StringType(), True),
-        StructField("account_id", StringType(), True),
-        StructField("confidence", DoubleType(), True),
-        StructField("match_type", StringType(), True),
-        StructField("jw_score", DoubleType(), True),
-        StructField("token_score", DoubleType(), True),
-        StructField("substring_score", DoubleType(), True),
-        StructField("dl_score", DoubleType(), True),
-        StructField("target_norm", StringType(), True)
-    ])
+    # 5. Strategy C: Phonetic Word Blocking
+    t_words = (
+        targets_clean
+        .withColumn("word", F.explode(F.split("target_norm", " ")))
+        .filter(~F.col("word").isin(STOP_WORDS))
+        .filter(F.length("word") > 2) 
+        .withColumn("sound", F.soundex("word"))
+    )
+    
+    u_words = (
+        universe_clean
+        .withColumn("word", F.explode(F.split("matched_norm", " ")))
+        .filter(~F.col("word").isin(STOP_WORDS))
+        .filter(F.length("word") > 2)
+        .withColumn("sound", F.soundex("word"))
+    )
+    
+    word_pairs = (
+        t_words.alias("t")
+        .join(u_words.alias("u"), on="sound")
+        .select(
+            F.col("t.target_id"), 
+            F.col("u.account_id"),
+            F.lit(0).alias("is_acronym")
+        )
+    )
 
-    # 6. Execute Zero-Shuffle RDD Operation
-    rdd_scored = universe_clean.rdd.mapPartitions(fuzzy_match_partition)
-    scored_candidates = spark.createDataFrame(rdd_scored, schema=output_schema)
+    # 6. Combine and Deduplicate
+    all_candidate_pairs = (
+        substring_pairs
+        .unionByName(acronym_pairs)
+        .unionByName(word_pairs)
+        .groupBy("target_id", "account_id")
+        .agg(F.max("is_acronym").alias("is_acronym"))
+    )
+    
+    candidates_to_score = (
+        all_candidate_pairs
+        .join(targets_clean, on="target_id")
+        .join(universe_clean, on="account_id")
+    )
+    
+    # 7. Heavy Scoring with Registered UDFs
+    substring_expr = F.when(
+        F.col("target_norm").contains(F.col("matched_norm")) |
+        F.col("matched_norm").contains(F.col("target_norm")),
+        F.lit(1.0)
+    ).otherwise(F.lit(0.0))
 
-    # 7. Apply Top N Filter
+    scored = (
+        candidates_to_score
+        .withColumn("jw_score", jw_udf(F.col("target_norm"), F.col("matched_norm")))
+        .withColumn("token_score", token_set_udf(F.col("target_norm"), F.col("matched_norm")))
+        .withColumn("substring_score", substring_expr)
+        .withColumn(
+            "dl_score",
+            F.when(
+                (F.col("jw_score") >= 0.75) | (substring_expr == 1),
+                dl_udf(F.col("target_norm"), F.col("matched_norm"))
+            ).otherwise(F.lit(0.0))
+        )
+        .withColumn(
+            "blend_score",
+            0.55 * F.col("jw_score") +
+            0.30 * F.col("token_score") +
+            0.10 * F.col("substring_score") +
+            0.05 * F.col("dl_score")
+        )
+        .withColumn(
+            "confidence",
+            F.round(
+                F.when(F.col("target_norm") == F.col("matched_norm"), 1.0)
+                .when(
+                    F.col("substring_score") == 1,
+                    F.greatest(F.col("blend_score"), F.lit(0.88))
+                )
+                .when(
+                    F.col("is_acronym") == 1,
+                    F.greatest(F.col("blend_score"), F.lit(0.87))
+                )
+                .when(
+                    (F.col("token_score") >= 0.999) &
+                    (F.col("jw_score") >= 0.80),
+                    F.greatest(F.col("blend_score"), F.lit(0.90))
+                )
+                .otherwise(F.col("blend_score")),
+                4
+            )
+        )
+        .withColumn(
+            "match_type",
+            F.when(F.col("target_norm") == F.col("matched_norm"), "exact")
+            .when(F.col("substring_score") == 1, "substring")
+            .when(F.col("is_acronym") == 1, "acronym")
+            .when(F.col("token_score") >= 0.999, "token_subset")
+            .otherwise("fuzzy"),
+        )
+        .filter(F.col("confidence") >= (min_confidence - 0.05))
+    )
+
+    # 8. Top N Filter
     if top_n:
         w = Window.partitionBy("target_norm").orderBy(F.desc("confidence"))
-        scored_candidates = (
-            scored_candidates
+        scored = (
+            scored
             .withColumn("rank", F.row_number().over(w))
             .where(F.col("rank") <= top_n)
             .drop("rank")
         )
 
-    # 8. Final Select and Deduplication
+    # 9. Final Output
     result = (
-        scored_candidates
-        .drop("target_norm")
+        scored
+        .select(
+            "athena_hq_est_total_spend",
+            "target_name",
+            "matched_name",
+            "account_id",
+            "confidence",
+            "match_type",
+            "jw_score",
+            "token_score",
+            "substring_score",
+            "dl_score"
+        )
         .dropDuplicates(["target_name", "account_id"])
     )
 
